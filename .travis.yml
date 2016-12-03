@@ -1,0 +1,22 @@
+language: cpp
+sudo: required
+compiler:
+  - gcc
+  - clang
+script:
+  - unzip src/sqlite3.h.zip -d src
+  - unzip src/sqlite3.c.zip -d src
+  - make
+install:
+  - if [ "$CC" = "gcc" ]; then export CXX="g++-5" CC="gcc-5"; fi
+  - if [ "$CC" = "clang" ]; then export CXX="clang++-3.8" CC="clang-3.8"; fi
+addons:
+  apt:
+    sources:
+    - ubuntu-toolchain-r-test
+    - llvm-toolchain-precise-3.8
+    packages:
+    - gcc-5
+    - g++-5
+    - clang-3.8
+    - unzip

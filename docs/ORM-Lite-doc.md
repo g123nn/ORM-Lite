@@ -3,11 +3,12 @@
 ## Requirement
 
 - **C++ 14** Support
-  - MSVC >= 14 (2015)
-  - gcc >= 5
-- **SQLite 3** (zipped in *src*)
+  - MSVC >= 14 (VS 2015)
+  - gcc >= 5.4
+  - Clang >= 3.8
+- **SQLite 3**
 
-## `BOT_ORM` Layout
+## `BOT_ORM` Modules
 
 ``` cpp
 #include "ORMLite.h"
@@ -19,7 +20,7 @@ Modules under `namespace BOT_ORM`
 
 - `BOT_ORM::Nullable`
 - `BOT_ORM::ORMapper`
-- `BOT_ORM::ORMapper::Queryable<QueryResult>`
+- `BOT_ORM::Queryable<QueryResult>`
 - `BOT_ORM::FieldExtractor`
 
 Modules under `namespace BOT_ORM::Expression`
@@ -27,7 +28,7 @@ Modules under `namespace BOT_ORM::Expression`
 - `BOT_ORM::Expression::Selectable`
 - `BOT_ORM::Expression::Field`
 - `BOT_ORM::Expression::NullableField`
-- `BOT_ORM::Expression::AggregateFunc`
+- `BOT_ORM::Expression::Aggregate`
 - `BOT_ORM::Expression::Expr`
 - `BOT_ORM::Expression::SetExpr`
 - `BOT_ORM::Expression::Count ()`
@@ -38,7 +39,7 @@ Modules under `namespace BOT_ORM::Expression`
 
 ## `BOT_ORM::Nullable`
 
-It keeps the Similar Semantic as `Nullable<T>` as `C#`; and
+It keeps the *Similar Semantic* of `Nullable<T>` as `C#`; and
 [Reference Here](http://stackoverflow.com/questions/2537942/nullable-values-in-c/28811646#28811646)
 
 ### Construction & Assignment
@@ -66,8 +67,9 @@ const Nullable<T> & operator= (const T &value);
 
 ### Get Value
 
-Return the `Underlying Value` of the object,
-which is **Valid** only if it's `NOT NULL`;
+Return the `Underlying Value` of the object or
+`Default Not-null Value` of `T`;
+(similar to `GetValueOrDefault` in C#)
 
 ``` cpp
 const T &Value (); const
@@ -127,10 +129,10 @@ Note that:
 - Field Names MUST **NOT** be SQL Keywords (SQL Constraint);
 - `std::string` Value MUST **NOT** contain `\0` (SQL Constraint);
 - `ORMAP (...)` will **auto** Inject some **private members**;
-  - Access by `BOT_ORM::ORMapper` and `BOT_ORM::FieldExtractor`;
   - `__Accept ()` to Implement **Visitor Pattern**;
   - `__Tuple ()` to **Flatten** data to tuple;
   - `__FieldNames ()` and `__TableName` to store strings;
+  - and the Access by Implementation;
 
 ### Connection
 
@@ -276,57 +278,54 @@ Queryable<MyClass> Query (MyClass queryHelper);
 ```
 
 Remarks:
-- Return new `Queryable` object;
+- Return new `Queryable` object with `QueryResult` is `MyClass`;
 - `MyClass` **MUST** be **Copy Constructible**
   to Construct `queryHelper`;
 
-## `BOT_ORM::ORMapper::Queryable<QueryResult>`
-
-> Why `Queryable` is inside `ORMapper`?
->
-> Since `Queryable` is a template,
-> it's hard to define an access to Injected Class's Private Members;
+## `BOT_ORM::Queryable<QueryResult>`
 
 ### Retrieve Result
 
 ``` cpp
-Nullable<T> Aggregate (
-    const Expression::AggregateFunc<T> &agg) const;
+Nullable<T> Select (const Expression::Aggregate<T> &agg) const;
 std::vector<QueryResult> ToVector () const;
 std::list<QueryResult> ToList () const;
 ```
 
 Remarks:
 - `QueryResult` specifies the **Row Type** of Query Result;
-- `Aggregate` will Get the one-or-zero-row Result
-  for `agg` immediately;
+- `Select` will Get the one-or-zero-row Result for `agg` immediately;
 - `ToVector` / `ToList` returns the Collection of `QueryResult`;
-- All Functions will **NOT** Change the State of this Queryable Object;
+- If the Result is `null` for `NOT Nullable` Field,
+  it will throw `std::runtime_error`
+  with message `Get Null Value for NOT Nullable Type`;
 - `Expression` will be described later;
 
 ### Set Conditions
 
 ``` cpp
-Queryable &Where (const Expression::Expr &expr);
+Queryable Distinct (bool isDistinct = true) const;
+Queryable Where (const Expression::Expr &expr) const;
 
-Queryable &GroupBy (const Expression::Field<T> &field);
-Queryable &Having (const Expression::Expr &expr);
+Queryable GroupBy (const Expression::Field<T> &field) const;
+Queryable Having (const Expression::Expr &expr) const;
 
-Queryable &OrderBy (const Expression::Field<T> &field);
-Queryable &OrderByDescending (const Expression::Field<T> &field);
+Queryable OrderBy (const Expression::Field<T> &field) const;
+Queryable OrderByDescending (const Expression::Field<T> &field) const;
 
-Queryable &Take (size_t count);
-Queryable &Skip (size_t count);
+Queryable Take (size_t count) const;
+Queryable Skip (size_t count) const;
 ```
 
 Remarks:
-- These functions will Set/Append Conditions to `this` and
-  return the reference of `*this`;
-- `OrderBy*` will **Append** `field` to Condition, while Other
-  functions will **Set** `expr`, `field` and `count` to Condition;
+- Default Selection is `ALL`;
+- These functions will Set/Append Conditions to a copy of `this`;
+- `OrderBy` will **Append** `field` to Condition,
+  while Other functions will **Set** `DISTINCT`,
+  `expr`, `field` or `count` to Condition;
 - `Expression` will be described later;
 
-### Construct New `Queryable`
+### Construct New `QueryResult`
 
 ``` cpp
 auto Select (const Expression::Selectable<T1> &target1,
@@ -339,11 +338,10 @@ auto LeftJoin (const MyClass2 &queryHelper2,
 ```
 
 Remarks:
-- Default `QueryResult` is the Object of `MyClass`,
-  which can be retrieved by `SELECT *` (**All Columns**);
+- Default Selection is **All Columns** (`SELECT *`);
 - `Select` will Set `QueryResult` to `std::tuple<T1, T2, ...>`,
   which can be retrieved by `SELECT target1, target2, ...`
-  (`target*` can be **Field** or **Aggregate Functions**);
+  (`target` can be **Field** or **Aggregate Functions**);
 - `Join` / `LeftJoin` will Set `QueryResult` to `std::tuple<...>`
   - `...` is the **flattened nullable concatenation** of all entries of
     **Previous** `QueryResult` and `queryHelper2`;
@@ -351,23 +349,37 @@ Remarks:
     all `Nullable<T>`, where `T` is the Supported Types of `ORMAP`
     (NOT `std::tuple` or `MyClass`);
   - `onExpr` specifies the `ON` Expression for `JOIN`;
-- All Functions will pass the **Conditions** of this Queryable Object
-  to the new one;
-- All Functions will **NOT** Change the State of this Queryable Object;
+- All Functions will pass the **Conditions** of `this` to the new one;
 - `Expression` will be described later;
+
+### Compound Select
+
+``` cpp
+Queryable Union (const Queryable &queryable) const;
+Queryable UnionAll (const Queryable &queryable) const;
+Queryable Intersect (const Queryable &queryable) const;
+Queryable Expect (const Queryable &queryable) const;
+```
+
+Remarks:
+- All Functions will return a Compound Select
+  for `this` and `queryable`;
+- All Functions will only **Inherit Conditions**
+  `OrderBy` and `Limit` from `this`;
 
 ### Query SQL
 
 We will use the following SQL to Query:
 
 ``` sql
-SELECT ...
+SELECT [DISTINCT] ...
 FROM TABLE
      [LEFT] JOIN TABLE ON ...
      ...
 WHERE ...
 GROUP BY <field>
 HAVING ...
+[<Compound> SELECT ... FROM ...]
 ORDER BY <field> [DESC], ...
 LIMIT <take> OFFSET <skip>;
 ```
@@ -385,7 +397,7 @@ Remarks:
 BOT_ORM::Expression::Selectable<T>
 BOT_ORM::Expression::Field<T> : public Selectable<T>
 BOT_ORM::Expression::NullableField<T> : public Field<T>
-BOT_ORM::Expression::AggregateFunc<T> : public Selectable<T>
+BOT_ORM::Expression::Aggregate<T> : public Selectable<T>
 ```
 
 #### Operations
@@ -469,40 +481,37 @@ Remarks:
 
 They will Generate Aggregate Functions as:
 
-- `COUNT (*)`
-- `COUNT (field)`
-- `SUM (field)`
-- `AVG (field)`
-- `MAX (field)`
-- `MIN (field)`
+- `size_t COUNT (*)`
+- `size_t COUNT (field)`
+- `T SUM (field)`
+- `T AVG (field)`
+- `T MAX (field)`
+- `T MIN (field)`
 
 ## `BOT_ORM::FieldExtractor`
 
-### Construction
-
 ``` cpp
-FieldExtractor (const MyClass &queryHelper,
+// Construction
+FieldExtractor (const MyClass1 &queryHelper1,
                 const MyClass2 &queryHelper2,
                 ...);
-```
 
-Remarks:
-- Construction of `FieldExtractor` will take all fields' pointers of
-  `queryHelper*` into a **Hash Table**;
-
-### Usage
-
-``` cpp
+// Get Field<> by operator ()
 Field<T> operator () (const T &field);
 NullableField<T> operator () (const Nullable<T> &field);
 ```
 
 Remarks:
-- `fieldExtractor (field)` will find the position of `field`
-  in the **Hash Table** from `queryHelper*` and Construct the `Field`;
+- Construction of `FieldExtractor` will take all fields' pointers of
+  `queryHelper` into a **Hash Table**;
+- `operator () (field)` will find the position of `field`
+  in the **Hash Table** from `queryHelper`
+  and Construct the corresponding `Field`;
 - If the `field` is `Nullable<T>`
   it will Construct a `NullableField<T>`;
   and it will Construct a `Field<T>` otherwise;
+- If `field` is not a member of `queryHelper`,
+  it will throw `std::runtime_error` with message `No Such Field...`;
 
 ## Error Handling
 

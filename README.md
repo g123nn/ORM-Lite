@@ -3,6 +3,10 @@
 **ORM Lite** is a C++ [_**Object Relation Mapping** (ORM)_](https://en.wikipedia.org/wiki/Object-relational_mapping) for **SQLite3**,
 written in Modern C++ style.
 
+|  Platform  | Visual Studio 2015 | gcc 5.4 & Clang 3.8 |
+|------------|--------------------|---------------------|
+| **Master** |[![Build status](https://ci.appveyor.com/api/projects/status/github/BOT-Man-JL/ORM-Lite?svg=true&branch=master)](https://ci.appveyor.com/project/BOT-Man-JL/ORM-Lite)|[![Build status](https://travis-ci.org/BOT-Man-JL/ORM-Lite.svg?branch=master)](https://travis-ci.org/BOT-Man-JL/ORM-Lite)|
+
 ## Features
 
 - Easy to Use
@@ -17,8 +21,13 @@ written in Modern C++ style.
 
 ### Including *ORM Lite*
 
-Before we start,
-Include `ORMLite.h` and `sqlite3.h`/`sqlite3.c` into your Project;
+Before we start, Include **src** into your Project:
+
+- `ORMLite.h`
+- **SQLite3** Dependency
+
+> If you haven't installed **SQLite3**,
+> you can find the zip file of `sqlite3.h` and `sqlite3.c` in `/src`
 
 ``` cpp
 #include "ORMLite.h"
@@ -54,8 +63,8 @@ In this Sample, `ORMAP ("UserModel", ...)` do that:
 ### Create or Drop a Table for the Class
 
 ``` cpp
-// Open a Connection with *test.db*
-ORMapper mapper ("test.db");
+// Open a Connection with *Sample.db*
+ORMapper mapper ("Sample.db");
 
 // Create a table for "UserModel"
 mapper.CreateTbl (UserModel {});
@@ -87,12 +96,13 @@ std::vector<UserModel> initObjs =
 for (const auto &obj : initObjs)
     mapper.Insert (obj);
 
-// Update Entry by Primary Key
 initObjs[1].salary = nullptr;
 initObjs[1].title = "St.";
+
+// Update Entity by Primary Key (WHERE UserModel.id = 1)
 mapper.Update (initObjs[1]);
 
-// Delete Entry by Primary Key
+// Delete Entity by Primary Key (WHERE UserModel.id = 2)
 mapper.Delete (initObjs[2]);
 
 // Transactional Statements
@@ -100,8 +110,8 @@ try
 {
     mapper.Transaction ([&] ()
     {
-        mapper.Delete (initObjs[0]);
-        mapper.Insert (UserModel { 1, "Joke", 0 });
+        mapper.Delete (initObjs[0]);  // OK
+        mapper.Insert (UserModel { 1, "Joke", 0 });  // Failed
     });
 }
 catch (const std::exception &ex)
@@ -151,7 +161,7 @@ mapper.Transaction ([&] () {
 UserModel helper;
 FieldExtractor field { helper };
 
-// Select by Query :-)
+// Select by Query
 auto result2 = mapper.Query (UserModel {})
     .Where (
         field (helper.user_name) & std::string ("July%") &&
@@ -175,10 +185,10 @@ auto result2 = mapper.Query (UserModel {})
 //            { 86, 17.2, "July_86", 33, null, "Mr. 16" },
 //            { 87, 17.4, "July_87", 33, null, "Mr. 17" }]
 
-// Calculate Aggregate Function by Query :-)
+// Calculate Aggregate Function by Query
 auto avg = mapper.Query (UserModel {})
     .Where (field (helper.user_name) & std::string ("July%"))
-    .Aggregate (Avg (field (helper.credit_count)));
+    .Select (Avg (field (helper.credit_count)));
 
 // Remarks:
 // sql = SELECT AVG (credit_count) FROM UserModel
@@ -186,25 +196,26 @@ auto avg = mapper.Query (UserModel {})
 // avg = 14.9
 
 auto count = mapper.Query (UserModel {})
-	.Where (field (helper.user_name) | std::string ("July%"))
-	.Aggregate (Count ());
+    .Where (field (helper.user_name) | std::string ("July%"))
+    .Select (Count ());
 
 // Remarks:
 // sql = SELECT COUNT (*) FROM UserModel
 //       WHERE (user_name NOT LIKE 'July%')
 // count = 2
 
-// Update by Condition :-)
-mapper.Update (UserModel {},
-			   (field (helper.age) = 10) &&
-			   (field (helper.credit_count) = 1.0),
-			   field (helper.user_name) == std::string ("July"));
+// Update by Condition
+mapper.Update (
+    UserModel {},
+    (field (helper.age) = 10) &&
+    (field (helper.credit_count) = 1.0),
+    field (helper.user_name) == std::string ("July"));
 
 // Remarks:
 // sql = UPDATE UserModel SET age=10,credit_count=1.0
 //       WHERE (user_name='July')
 
-// Delete by Condition :-)
+// Delete by Condition
 mapper.Delete (UserModel {},
                field (helper.user_id) >= 90);
 
@@ -242,7 +253,7 @@ auto joinedQuery = mapper.Query (UserModel {})
     .Where (field (user.user_id) >= 65);
 
 // Get Result to List
-// There is Join Called, so the Result are Nullable-Tuples
+// Results are Nullable-Tuples
 auto result3 = joinedQuery.ToList ();
 
 // Remarks:
@@ -261,7 +272,7 @@ auto result3 = joinedQuery.ToList ();
 //            ... ]
 
 // Group & Having ~
-// There is Select Called, so the Result are Nullable-Tuples
+// Results are Nullable-Tuples
 auto result4 = joinedQuery
     .Select (field (order.user_id),
              field (user.user_name),
@@ -286,11 +297,48 @@ auto result4 = joinedQuery
 //       LIMIT ~0 OFFSET 3
 // result4 = [(73, "July_73", 23.25),
 //            (74, "July_74", 24.25)]
+
+// Compound Select
+// Results are Nullable-Tuples
+auto result5 = mapper.Query (OrderModel {})
+    .Select (field (order.product_name), field (order.user_id))
+    .Where (field (order.user_id) == 50)
+    .Union (
+        joinedQuery
+        .Select (field (user.user_name), field (order.order_id))
+    )
+    .Take (4)
+    .ToList ();
+
+// sql = SELECT OrderModel.product_name,
+//              OrderModel.user_id
+//       FROM OrderModel
+//            WHERE (OrderModel.user_id==50)
+//       UNION
+//       SELECT UserModel.user_name,
+//              OrderModel.order_id
+//       FROM UserModel
+//            JOIN OrderModel
+//            ON UserModel.user_id=OrderModel.user_id
+//            LEFT JOIN SellerModel
+//            ON SellerModel.seller_id=OrderModel.seller_id
+//            WHERE (UserModel.user_id>=65)
+//       LIMIT 4;
+// result5 = [("Item 0", 50),
+//            ("Item 1", 50),
+//            ("July_65", 31),
+//            ("July_65", 32)]
 ```
 
-## Implementation Details
+## Planned Features
 
-Details of the Design in **Chinese** are posted on my
-[Blog](https://BOT-Man-JL.github.io/articles/#2016/How-to-Design-a-Naive-Cpp-ORM);
+- Blob / DateTime Types
+- Subquery
+- Constraints on Creating Table
 
-There will be a new Post detailing the New Design soon ~ 😉
+## Implementation Details （实现细节）
+
+Posts in **Chinese** only:
+
+- [How to Design a Naive C++ ORM](https://BOT-Man-JL.github.io/articles/#2016/How-to-Design-a-Naive-Cpp-ORM)
+- [How to Design a Better C++ ORM](https://BOT-Man-JL.github.io/articles/#2016/How-to-Design-a-Better-Cpp-ORM)
