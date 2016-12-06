@@ -26,19 +26,22 @@
 #define ORMAP(_TABLE_NAME_, ...)                          \
 private:                                                  \
 friend class BOT_ORM::ORMapper;                           \
-template <typename Q> friend class BOT_ORM::Queryable;    \
 friend class BOT_ORM::FieldExtractor;                     \
+template <typename T>                                     \
+friend class BOT_ORM::Queryable;                          \
+template <typename T>                                     \
+friend class BOT_ORM_Impl::HasInjected;                   \
 template <typename T>                                     \
 friend auto BOT_ORM_Impl::JoinToTuple (const T &);        \
 template <typename FN>                                    \
 void __Accept (FN fn)                                     \
 {                                                         \
-    BOT_ORM_Impl::FnVisitor::Visit (fn, __VA_ARGS__);     \
+    BOT_ORM_Impl::InjectedHelper::Visit (fn, __VA_ARGS__);\
 }                                                         \
 template <typename FN>                                    \
 void __Accept (FN fn) const                               \
 {                                                         \
-    BOT_ORM_Impl::FnVisitor::Visit (fn, __VA_ARGS__);     \
+    BOT_ORM_Impl::InjectedHelper::Visit (fn, __VA_ARGS__);\
 }                                                         \
 auto __Tuple () const                                     \
 {                                                         \
@@ -47,14 +50,21 @@ auto __Tuple () const                                     \
 static const std::vector<std::string> &__FieldNames ()    \
 {                                                         \
     static const std::vector<std::string> _fieldNames {   \
-        BOT_ORM_Impl::FieldNameHelper::ExtractFieldName ( \
+        BOT_ORM_Impl::InjectedHelper::ExtractFieldName (  \
         #__VA_ARGS__) };                                  \
     return _fieldNames;                                   \
 }                                                         \
 constexpr static const char *__TableName =  _TABLE_NAME_; \
 
+// Private Macros
+
+#define NO_ORMAP "Please Inject the Class with 'ORMAP' first"
+#define BAD_TYPE "Only Support Integral, Floating Point and std::string"
+#define NO_FIELD "No Such Field for current Extractor"
+#define NULL_DESERIALIZE "Get Null Value for NOT Nullable Type"
+
 // Nullable Template
-// http://stackoverflow.com/questions/2537942/nullable-values-in-c/28811646#28811646
+// https://stackoverflow.com/questions/2537942/nullable-values-in-c/28811646#28811646
 
 namespace BOT_ORM
 {
@@ -154,7 +164,7 @@ namespace BOT_ORM
 
 namespace BOT_ORM_Impl
 {
-	// Naive SQL Driver ... (Improved Later)
+	// Naive SQL Driver ... (Todo: Improved Later)
 
 	class SQLConnector
 	{
@@ -166,8 +176,8 @@ namespace BOT_ORM_Impl
 			{
 				sqlite3_close (db);
 				throw std::runtime_error (
-					std::string ("Can't open database: %s\n")
-					+ sqlite3_errmsg (db));
+					std::string ("SQL error: Can't open database '")
+					+ sqlite3_errmsg (db) + "'");
 			}
 		}
 
@@ -210,7 +220,7 @@ namespace BOT_ORM_Impl
 			if (rc != SQLITE_OK)
 			{
 				auto errStr = std::string ("SQL error: '") + zErrMsg
-					+ "' at '" + cmd;
+					+ "' at '" + cmd + "'";
 				sqlite3_free (zErrMsg);
 				throw std::runtime_error (errStr);
 			}
@@ -220,6 +230,27 @@ namespace BOT_ORM_Impl
 		sqlite3 *db;
 		static void _callback (int argc, char **argv, char **azColName)
 		{ return; }
+	};
+
+	// Checking Injection
+	// https://stackoverflow.com/questions/87372/check-if-a-class-has-a-member-function-of-a-given-signature
+
+	template<typename T> class HasInjected
+	{
+		template<typename U> struct SFINAE {};
+		template<typename U> static constexpr std::true_type Test (
+			SFINAE<decltype (U::__TableName)>*)
+		{
+			return std::true_type {};
+		}
+		template<typename U> static constexpr std::false_type Test (...)
+		{
+			return std::false_type {};
+		}
+	public:
+		static constexpr bool value =
+			decltype (Test<std::remove_reference_t<
+					  std::remove_cv_t<T>>> (nullptr))::value;
 	};
 
 	// Helper - Serialize
@@ -259,8 +290,7 @@ namespace BOT_ORM_Impl
 		if (value)
 			std::istringstream { value } >> property;
 		else
-			throw std::runtime_error (
-				"Get Null Value for NOT Nullable Type");
+			throw std::runtime_error (NULL_DESERIALIZE);
 	}
 
 	template <>
@@ -270,8 +300,7 @@ namespace BOT_ORM_Impl
 		if (value)
 			property = value;
 		else
-			throw std::runtime_error (
-				"Get Null Value for NOT Nullable Type");
+			throw std::runtime_error (NULL_DESERIALIZE);
 	}
 
 	template <typename T>
@@ -307,11 +336,8 @@ namespace BOT_ORM_Impl
 			? "text not null"
 			: nullptr;
 
-		static_assert (
-			typeStr != nullptr,
-			"Only Support Integral, Floating Point and std::string :-)");
-
-		return typeStr;;
+		static_assert (typeStr != nullptr, BAD_TYPE);
+		return typeStr;
 	}
 
 	template <typename T>
@@ -331,18 +357,32 @@ namespace BOT_ORM_Impl
 			? "text"
 			: nullptr;
 
-		static_assert (
-			typeStr != nullptr,
-			"Only Support Integral, Floating Point and std::string :-)");
-
-		return typeStr;;
+		static_assert (typeStr != nullptr, BAD_TYPE);
+		return typeStr;
 	}
 
-	// Injection Helper - Fn Visitor
+	// Injected Helper
 
-	class FnVisitor
+	struct InjectedHelper
 	{
-	public:
+		static std::vector<std::string> ExtractFieldName (std::string input)
+		{
+			std::vector<std::string> ret;
+			std::string tmpStr;
+
+			for (const auto &ch : std::move (input) + ",")
+			{
+				if (isalnum (ch) || ch == '_')
+					tmpStr += ch;
+				else if (ch == ',')
+				{
+					ret.push_back (tmpStr);
+					tmpStr.clear ();
+				}
+			}
+			return ret;
+		};
+
 		template <typename Fn, typename... Args>
 		static inline void Visit (Fn fn, Args & ... args)
 		{
@@ -362,29 +402,6 @@ namespace BOT_ORM_Impl
 		{
 			return fn (property);
 		}
-	};
-
-	// Injection Helper - Extract Field Names
-
-	struct FieldNameHelper
-	{
-		static std::vector<std::string> ExtractFieldName (std::string input)
-		{
-			std::vector<std::string> ret;
-			std::string tmpStr;
-
-			for (const auto &ch : std::move (input) + ",")
-			{
-				if (isalnum (ch) || ch == '_')
-					tmpStr += ch;
-				else if (ch == ',')
-				{
-					ret.push_back (tmpStr);
-					tmpStr.clear ();
-				}
-			}
-			return ret;
-		};
 	};
 }
 
@@ -698,10 +715,11 @@ namespace BOT_ORM_Impl
 	template <typename C>
 	inline auto JoinToTuple (const C &arg)
 	{
-		// Injection Helper
+		// Injected friend
 
 		using TupleType = decltype (arg.__Tuple ());
 		constexpr size_t size = std::tuple_size<TupleType>::value;
+
 		return TupleHelper<TupleType, size>::ToNullable (
 			arg.__Tuple ());
 	}
@@ -898,23 +916,13 @@ namespace BOT_ORM
 		inline auto Join (const C &queryHelper2,
 						  const Expression::Expr &onExpr) const
 		{
-			return _NewQuery (
-				_sqlTarget,
-				_sqlFrom + " join " +
-				std::string (C::__TableName) +
-				" on " + onExpr.ToString (true),
-				BOT_ORM_Impl::JoinToTuple (_queryHelper, queryHelper2));
+			return _NewJoinQuery (queryHelper2, onExpr, " join ");
 		}
 		template <typename C>
 		inline auto LeftJoin (const C &queryHelper2,
 							  const Expression::Expr &onExpr) const
 		{
-			return _NewQuery (
-				_sqlTarget,
-				_sqlFrom + " left join " +
-				std::string (C::__TableName) +
-				" on " + onExpr.ToString (true),
-				BOT_ORM_Impl::JoinToTuple (_queryHelper, queryHelper2));
+			return _NewJoinQuery (queryHelper2, onExpr, " left join ");
 		}
 
 		// Compound Select
@@ -977,6 +985,32 @@ namespace BOT_ORM
 					_sqlWhere, _sqlGroupBy, _sqlHaving,
 					_sqlOrderBy, _sqlLimit, _sqlOffset
 			};
+		}
+
+		// Return a new Join Queryable Object
+		template <typename C>
+		inline auto _NewJoinQuery (const C &queryHelper2,
+								   const Expression::Expr &onExpr,
+								   std::string joinStr,
+								   std::enable_if_t<
+								   !BOT_ORM_Impl::HasInjected<C>::value>
+								   * = nullptr) const
+		{
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		inline auto _NewJoinQuery (const C &queryHelper2,
+								   const Expression::Expr &onExpr,
+								   std::string joinStr,
+								   std::enable_if_t<
+								   BOT_ORM_Impl::HasInjected<C>::value>
+								   * = nullptr) const
+		{
+			return _NewQuery (
+				_sqlTarget,
+				_sqlFrom + std::move (joinStr) + C::__TableName +
+				" on " + onExpr.ToString (true),
+				BOT_ORM_Impl::JoinToTuple (_queryHelper, queryHelper2));
 		}
 
 		// Return a new Compound Queryable Object
@@ -1059,7 +1093,14 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		void CreateTbl (const C &entity)
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			CreateTbl (const C &entity)
+		{
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			CreateTbl (const C &entity)
 		{
 			const auto &fieldNames = C::__FieldNames ();
 			std::vector<std::string> strTypes (fieldNames.size ());
@@ -1083,7 +1124,14 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		void DropTbl (const C &)
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			DropTbl (const C &)
+		{
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			DropTbl (const C &)
 		{
 			_connector.Execute ("drop table " +
 								std::string (C::__TableName) +
@@ -1091,7 +1139,14 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		void Insert (const C &entity, bool withId = true)
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			Insert (const C &entity, bool withId = true)
+		{
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			Insert (const C &entity, bool withId = true)
 		{
 			std::ostringstream os;
 			size_t index = 0;
@@ -1113,11 +1168,17 @@ namespace BOT_ORM
 								" values (" + os.str () + ");");
 		}
 
-		template <typename In>
-		void InsertRange (const In &entities, bool withId = true)
+		template <typename In, typename C = typename In::value_type>
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			InsertRange (const In &entities, bool withId = true)
 		{
-			using C = typename In::value_type;
-
+			static_assert (
+				BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename In, typename C = typename In::value_type>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			InsertRange (const In &entities, bool withId = true)
+		{
 			std::ostringstream os;
 			size_t count = 0;
 			auto fieldCount = C::__FieldNames ().size ();
@@ -1151,7 +1212,14 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		void Update (const C &entity)
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			Update (const C &entity)
+		{
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			Update (const C &entity)
 		{
 			std::stringstream os, osKey;
 			size_t index = 0;
@@ -1185,11 +1253,16 @@ namespace BOT_ORM
 								" " + osKey.str () + ";");
 		}
 
-		template <typename In>
-		void UpdateRange (const In &entities)
+		template <typename In, typename C = typename In::value_type>
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			UpdateRange (const In &entities)
 		{
-			using C = typename In::value_type;
-
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename In, typename C = typename In::value_type>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			UpdateRange (const In &entities)
+		{
 			std::stringstream os;
 			const auto &fieldNames = C::__FieldNames ();
 
@@ -1227,9 +1300,18 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		inline void Update (const C &,
-							const Expression::SetExpr &setExpr,
-							const Expression::Expr &whereExpr)
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			Update (const C &,
+					const Expression::SetExpr &setExpr,
+					const Expression::Expr &whereExpr)
+		{
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			Update (const C &,
+					const Expression::SetExpr &setExpr,
+					const Expression::Expr &whereExpr)
 		{
 			_connector.Execute ("update " +
 								std::string (C::__TableName) +
@@ -1239,7 +1321,14 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		void Delete (const C &entity)
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			Delete (const C &entity)
+		{
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			Delete (const C &entity)
 		{
 			std::stringstream os;
 			os << "where ";
@@ -1257,8 +1346,16 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		inline void Delete (const C &,
-							const Expression::Expr &whereExpr)
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			Delete (const C &,
+					const Expression::Expr &whereExpr)
+		{
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			Delete (const C &,
+					const Expression::Expr &whereExpr)
 		{
 			_connector.Execute ("delete from " +
 								std::string (C::__TableName) +
@@ -1267,11 +1364,15 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		inline Queryable<C> Query (C queryHelper)
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value, Queryable<C>>
+			Query (C queryHelper)
 		{
-			static_assert (std::is_copy_constructible<C>::value,
-						   "It must be Copy Constructible");
-
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
+		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value, Queryable<C>>
+			Query (C queryHelper)
+		{
 			return Queryable<C> { _connector,
 				std::move (queryHelper),
 				std::string (" from ") + C::__TableName };
@@ -1287,36 +1388,42 @@ namespace BOT_ORM
 	{
 		using pair_type = std::pair<std::string, const char *>;
 
-	public:
-		template <typename... Args>
-		FieldExtractor (const Args & ... args)
+		template <typename C>
+		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+			Extract (const C &helper)
 		{
-			BOT_ORM_Impl::FnVisitor::Visit ([this] (auto &helper)
-			{
-				const auto &fieldNames =
-					std::remove_reference_t<
-					std::remove_cv_t<decltype (helper)>
-					>::__FieldNames ();
-				constexpr auto tableName =
-					std::remove_reference_t<
-					std::remove_cv_t<decltype (helper)>
-					>::__TableName;
-
-				size_t index = 0;
-				helper.__Accept (
-					[this, &index, &fieldNames, &tableName] (auto &val)
-				{
-					_map.emplace ((const void *) &val, pair_type {
-						fieldNames[index++], tableName });
-					return true;
-				});
-				return true;
-			}, args...);
+			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
 		}
+		template <typename C>
+		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+			Extract (const C &helper)
+		{
+			// Why Place these local vars here:
+			// Walk around gcc/clang 'undefined reference' HELL...
+			const auto &fieldNames = C::__FieldNames ();
+			constexpr auto tableName = C::__TableName;
+
+			size_t index = 0;
+			helper.__Accept (
+				[this, &index, &fieldNames, &tableName] (auto &val)
+			{
+				_map.emplace ((const void *) &val, pair_type {
+					fieldNames[index++], tableName });
+				return true;
+			});
+		}
+
+	public:
+		template <typename Arg>
+		FieldExtractor (const Arg &arg) { Extract (arg); }
+
+		template <typename Arg, typename... Args>
+		FieldExtractor (const Arg &arg, const Args & ... args)
+			: FieldExtractor (args...) { Extract (arg); }
 
 		template <typename T>
 		inline Expression::Field<T> operator () (
-			const T &field)
+			const T &field) const
 		{
 			const auto &result = Get (field);
 			return Expression::Field<T> {
@@ -1325,7 +1432,7 @@ namespace BOT_ORM
 
 		template <typename T>
 		inline Expression::NullableField<T> operator () (
-			const Nullable<T> &field)
+			const Nullable<T> &field) const
 		{
 			const auto &result = Get (field);
 			return Expression::NullableField<T> {
@@ -1336,18 +1443,18 @@ namespace BOT_ORM
 		std::unordered_map<const void *, pair_type> _map;
 
 		template <typename T>
-		const pair_type &Get (const T &field)
+		const pair_type &Get (const T &field) const
 		{
-			try
-			{
-				return _map.at ((const void *) &field);
-			}
-			catch (...)
-			{
-				throw std::runtime_error ("No Such Field...");
-			}
+			try { return _map.at ((const void *) &field); }
+			catch (...) { throw std::runtime_error (NO_FIELD); }
 		}
 	};
 }
+
+// Clear Intra Macros
+#undef NO_ORMAP
+#undef BAD_TYPE
+#undef NO_FIELD
+#undef NULL_DESERIALIZE
 
 #endif // !BOT_ORM_H
