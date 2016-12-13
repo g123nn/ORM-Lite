@@ -40,42 +40,14 @@
 
 #define ORMAP(_TABLE_NAME_, ...)                          \
 private:                                                  \
-friend class BOT_ORM::ORMapper;                           \
-friend class BOT_ORM::FieldExtractor;                     \
-template <typename T>                                     \
-friend class BOT_ORM::Queryable;                          \
-friend class BOT_ORM_Impl::QueryableHelper;               \
-template <typename T>                                     \
-friend class BOT_ORM_Impl::HasInjected;                   \
-auto &__PrimaryKey ()                                     \
-{                                                         \
-return BOT_ORM_Impl::InjectedHelper::First (__VA_ARGS__); \
-}                                                         \
-auto &__PrimaryKey () const                               \
-{                                                         \
-return BOT_ORM_Impl::InjectedHelper::First (__VA_ARGS__); \
-}                                                         \
+friend class BOT_ORM_Impl::InjectionHelper;               \
 template <typename FN>                                    \
-void __Accept (FN fn)                                     \
-{                                                         \
-    BOT_ORM_Impl::InjectedHelper::Visit (fn, __VA_ARGS__);\
-}                                                         \
+inline decltype (auto) __Accept (FN fn)                   \
+{ return fn (__VA_ARGS__); }                              \
 template <typename FN>                                    \
-void __Accept (FN fn) const                               \
-{                                                         \
-    BOT_ORM_Impl::InjectedHelper::Visit (fn, __VA_ARGS__);\
-}                                                         \
-auto __Tuple () const                                     \
-{                                                         \
-    return std::make_tuple (__VA_ARGS__);                 \
-}                                                         \
-static const std::vector<std::string> &__FieldNames ()    \
-{                                                         \
-    static const std::vector<std::string> _fieldNames {   \
-        BOT_ORM_Impl::InjectedHelper::ExtractFieldName (  \
-            #__VA_ARGS__) };                              \
-    return _fieldNames;                                   \
-}                                                         \
+inline decltype (auto) __Accept (FN fn) const             \
+{ return fn (__VA_ARGS__); }                              \
+constexpr static const char *__FieldNames = #__VA_ARGS__; \
 constexpr static const char *__TableName =  _TABLE_NAME_; \
 
 // Private Macros
@@ -208,24 +180,40 @@ namespace BOT_ORM_Impl
 			sqlite3_close (db);
 		}
 
-		// Don't throw in callback
-		void Execute (const std::string &cmd,
-					  std::function<void (int argc, char **argv,
-										  char **azColName) noexcept>
-					  callback = _callback)
+		void Execute (const std::string &cmd)
 		{
-			const size_t MAX_TRIAL = 16;
 			char *zErrMsg = 0;
 			int rc;
 
-			auto callbackWrapper = [] (void *fn, int argc, char **argv,
-									   char **azColName)
+			for (size_t iTry = 0; iTry < MAX_TRIAL; iTry++)
 			{
-				static_cast<std::function
-					<void (int argc,
-						   char **argv,
-						   char **azColName) noexcept> *>
-						   (fn)->operator()(argc, argv, azColName);
+				rc = sqlite3_exec (db, cmd.c_str (), 0, 0, &zErrMsg);
+				if (rc != SQLITE_BUSY)
+					break;
+
+				std::this_thread::sleep_for (
+					std::chrono::microseconds (20));
+			}
+
+			if (rc != SQLITE_OK)
+			{
+				auto errStr = std::string ("SQL error: '") + zErrMsg
+					+ "' at '" + cmd + "'";
+				sqlite3_free (zErrMsg);
+				throw std::runtime_error (errStr);
+			}
+		}
+
+		void ExecuteCallback (const std::string &cmd,
+							  std::function<void (char **) noexcept> callback)
+		{
+			char *zErrMsg = 0;
+			int rc;
+
+			auto callbackWrapper = [] (void *fn, int, char **argv, char **)
+			{
+				static_cast<std::function<void (char **argv) noexcept> *>
+					(fn)->operator()(argv);
 				return 0;
 			};
 
@@ -236,7 +224,8 @@ namespace BOT_ORM_Impl
 				if (rc != SQLITE_BUSY)
 					break;
 
-				std::this_thread::sleep_for (std::chrono::microseconds (20));
+				std::this_thread::sleep_for (
+					std::chrono::microseconds (20));
 			}
 
 			if (rc != SQLITE_OK)
@@ -250,93 +239,127 @@ namespace BOT_ORM_Impl
 
 	private:
 		sqlite3 *db;
-		static inline void _callback (int, char **, char **) { return; }
+		constexpr static size_t MAX_TRIAL = 16;
 	};
 
-	// Checking Injection
-	template <typename T> class HasInjected
-	{
-		template <typename...> struct void_t_Tester { using type = void; };
-		template <typename... _Types>
-		using void_t = typename void_t_Tester<_Types...>::type;
+	// Helper - Field Type Checker
 
-		template <typename, typename = void_t<>>
-		struct Test : std::false_type {};
-		template <typename U>
-		struct Test <U, void_t<decltype (U::__TableName)>>
-			: std::true_type {};
-	public:
-		static constexpr bool value = Test<T>::value;
+	template <typename T>
+	struct TypeString
+	{
+		constexpr static const char *typeStr =
+			(std::is_integral<T>::value &&
+			 !std::is_same<T, char>::value &&
+			 !std::is_same<T, wchar_t>::value &&
+			 !std::is_same<T, char16_t>::value &&
+			 !std::is_same<T, char32_t>::value &&
+			 !std::is_same<T, unsigned char>::value)
+			? " integer not null"
+			: (std::is_floating_point<T>::value)
+			? " real not null"
+			: (std::is_same<T, std::string>::value)
+			? " text not null"
+			: nullptr;
+
+		static_assert (typeStr != nullptr, BAD_TYPE);
 	};
 
-	// Helper - Serialize
-
 	template <typename T>
-	inline bool SerializeValue (
-		std::ostream &os,
-		const T &value)
+	struct TypeString <BOT_ORM::Nullable<T>>
 	{
-		os << value;
-		return true;
-	}
+		constexpr static const char *typeStr =
+			(std::is_integral<T>::value &&
+			 !std::is_same<T, char>::value &&
+			 !std::is_same<T, wchar_t>::value &&
+			 !std::is_same<T, char16_t>::value &&
+			 !std::is_same<T, char32_t>::value &&
+			 !std::is_same<T, unsigned char>::value)
+			? " integer"
+			: (std::is_floating_point<T>::value)
+			? " real"
+			: (std::is_same<T, std::string>::value)
+			? " text"
+			: nullptr;
 
-	template <>
-	inline bool SerializeValue <std::string> (
-		std::ostream &os,
-		const std::string &value)
+		static_assert (typeStr != nullptr, BAD_TYPE);
+	};
+
+	// Serialization Helper
+
+	struct SerializationHelper
 	{
-		os << "'" << value << "'";
-		return true;
-	}
-
-	template <typename T>
-	inline bool SerializeValue (
-		std::ostream &os,
-		const BOT_ORM::Nullable<T> &value)
-	{
-		if (value == nullptr) return false;
-		return SerializeValue (os, value.Value ());
-	}
-
-	// Helper - Deserialize
-
-	template <typename T>
-	inline void DeserializeValue (
-		T &property, const char *value)
-	{
-		if (value)
-			std::istringstream { value } >> property;
-		else
-			throw std::runtime_error (NULL_DESERIALIZE);
-	}
-
-	template <>
-	inline void DeserializeValue <std::string> (
-		std::string &property, const char *value)
-	{
-		if (value)
-			property = value;
-		else
-			throw std::runtime_error (NULL_DESERIALIZE);
-	}
-
-	template <typename T>
-	inline void DeserializeValue (
-		BOT_ORM::Nullable<T> &property, const char *value)
-	{
-		if (value)
+		template <typename T>
+		static inline
+			std::enable_if_t<TypeString<T>::typeStr == nullptr, bool>
+			Serialize (std::ostream &os, const T &value)
+		{}
+		template <typename T>
+		static inline
+			std::enable_if_t<TypeString<T>::typeStr != nullptr, bool>
+			Serialize (std::ostream &os, const T &value)
 		{
-			T val;
-			DeserializeValue (val, value);
-			property = val;
+			os << value;
+			return true;
 		}
-		else
-			property = nullptr;
-	}
 
-	// Injected Helper
+		static inline bool Serialize (std::ostream &os,
+									  const std::string &value)
+		{
+			os << "'" << value << "'";
+			return true;
+		}
 
-	struct InjectedHelper
+		template <typename T>
+		static inline bool Serialize (
+			std::ostream &os,
+			const BOT_ORM::Nullable<T> &value)
+		{
+			if (value == nullptr) return false;
+			return Serialize (os, value.Value ());
+		}
+	};
+
+	// Deserialization Helper
+
+	struct DeserializationHelper
+	{
+		template <typename T>
+		static inline std::enable_if_t<TypeString<T>::typeStr == nullptr>
+			Deserialize (T &property, const char *value)
+		{}
+		template <typename T>
+		static inline std::enable_if_t<TypeString<T>::typeStr != nullptr>
+			Deserialize (T &property, const char *value)
+		{
+			if (value) std::istringstream { value } >> property;
+			else throw std::runtime_error (NULL_DESERIALIZE);
+		}
+
+		static inline void Deserialize (std::string &property,
+										const char *value)
+		{
+			if (value) property = value;
+			else throw std::runtime_error (NULL_DESERIALIZE);
+		}
+
+		template <typename T>
+		static inline void Deserialize (
+			BOT_ORM::Nullable<T> &property, const char *value)
+		{
+			if (value)
+			{
+				T val;
+				Deserialize (val, value);
+				property = val;
+			}
+			else
+				property = nullptr;
+		}
+	};
+
+	// Injection Helper
+
+	class InjectionHelper
 	{
 		static std::vector<std::string> ExtractFieldName (std::string input)
 		{
@@ -356,18 +379,48 @@ namespace BOT_ORM_Impl
 			return ret;
 		};
 
-		template <typename Arg, typename... Args>
-		static inline auto &First (Arg &arg, Args & ...)
+	public:
+
+		// Checking Injection
+		template <typename T> class HasInjected
 		{
-			return arg;
+			template <typename...> struct void_t_Tester { using type = void; };
+			template <typename... _Types>
+			using void_t = typename void_t_Tester<_Types...>::type;
+
+			template <typename, typename = void_t<>>
+			struct Test : std::false_type {};
+			template <typename U>
+			struct Test <U, void_t<decltype (U::__TableName)>>
+				: std::true_type {};
+
+		public:
+			static constexpr bool value = Test<T>::value;
+
+			static_assert (value, NO_ORMAP);
+		};
+
+		// Proxy Function
+		template <typename C, typename Fn>
+		static inline decltype (auto) Visit (C &obj, Fn fn)
+		{
+			return obj.__Accept (fn);
 		}
 
-		template <typename Fn, typename Arg, typename... Args>
-		static inline void Visit (Fn fn, Arg &, Args & ... args)
+		// Field Name Proxy
+		template <typename C>
+		static inline const std::vector<std::string> &FieldNames (const C &)
 		{
-			// Unpacking Tricks :-)
-			using expander = int[];
-			(void) expander { 0, ((void) fn (args), 0)... };
+			static const auto fieldNames = ExtractFieldName (C::__FieldNames);
+			return fieldNames;
+		}
+
+		// Table Name Proxy
+		template <typename C>
+		static inline const std::string &TableName (const C &)
+		{
+			static const std::string tableName { C::__TableName };
+			return tableName;
 		}
 	};
 }
@@ -400,10 +453,12 @@ namespace BOT_ORM
 		struct Selectable
 		{
 			std::string fieldName;
-			const char *prefixStr;
+			const std::string *tableName;
 
-			Selectable (std::string &&_fieldName, const char *_prefixStr)
-				: fieldName (_fieldName), prefixStr (_prefixStr) {}
+			Selectable (std::string _fieldName,
+						const std::string *_tableName)
+				: fieldName (std::move (_fieldName)), tableName (_tableName)
+			{}
 		};
 
 		// Field : Selectable
@@ -411,15 +466,15 @@ namespace BOT_ORM
 		template <typename T>
 		struct Field : public Selectable<T>
 		{
-			Field (std::string fieldName,
-				   const char *tableName)
-				: Selectable<T> (std::move (fieldName), tableName) {}
+			Field (std::string _fieldName,
+				   const std::string *_tableName)
+				: Selectable<T> (std::move (_fieldName), _tableName) {}
 
 			inline SetExpr operator = (T value)
 			{
 				std::ostringstream os;
-				BOT_ORM_Impl::SerializeValue (
-					os << this->fieldName << "=", value);
+				BOT_ORM_Impl::SerializationHelper::
+					Serialize (os << this->fieldName << "=", value);
 				return SetExpr { os.str () };
 			}
 		};
@@ -429,15 +484,15 @@ namespace BOT_ORM
 		template <typename T>
 		struct NullableField : public Field<T>
 		{
-			NullableField (std::string fieldName,
-						   const char *tableName)
-				: Field<T> (std::move (fieldName), tableName) {}
+			NullableField (std::string _fieldName,
+						   const std::string *_tableName)
+				: Field<T> (std::move (_fieldName), _tableName) {}
 
 			inline SetExpr operator = (T value)
 			{
 				std::ostringstream os;
-				BOT_ORM_Impl::SerializeValue (
-					os << this->fieldName << "=", value);
+				BOT_ORM_Impl::SerializationHelper::
+					Serialize (os << this->fieldName << "=", value);
 				return SetExpr { os.str () };
 			}
 
@@ -454,8 +509,10 @@ namespace BOT_ORM
 				: Selectable<T> (std::move (function), nullptr) {}
 
 			Aggregate (std::string function, const Field<T> &field)
-				: Selectable<T> (function + "(" + field.prefixStr +
-								 "." + field.fieldName + ")", nullptr) {}
+				: Selectable<T> (std::move (function) + "(" +
+								 *(field.tableName) + "." +
+								 field.fieldName + ")", nullptr)
+			{}
 		};
 
 		// Expr
@@ -465,7 +522,7 @@ namespace BOT_ORM
 			template <typename T>
 			Expr (const Selectable<T> &field,
 				  std::string op_val)
-				: exprs { { field.fieldName + op_val, field.prefixStr } }
+				: exprs { { field.fieldName + op_val, field.tableName } }
 			{}
 
 			template <typename T>
@@ -473,9 +530,9 @@ namespace BOT_ORM
 				  std::string op, T value)
 			{
 				std::ostringstream os;
-				BOT_ORM_Impl::SerializeValue (
-					os << field.fieldName << op, value);
-				exprs.emplace_back (os.str (), field.prefixStr);
+				BOT_ORM_Impl::SerializationHelper::
+					Serialize (os << field.fieldName << op, value);
+				exprs.emplace_back (os.str (), field.tableName);
 			}
 
 			template <typename T>
@@ -484,9 +541,9 @@ namespace BOT_ORM
 				  const Field<T> &field2)
 				: exprs
 			{
-				{ field1.fieldName, field1.prefixStr },
+				{ field1.fieldName, field1.tableName },
 				{ std::move (op), nullptr },
-				{ field2.fieldName, field2.prefixStr }
+				{ field2.fieldName, field2.tableName }
 			}
 			{}
 
@@ -496,7 +553,7 @@ namespace BOT_ORM
 				for (const auto &expr : exprs)
 				{
 					if (withTableName && expr.second != nullptr)
-						out << expr.second << ".";
+						out << *(expr.second) << ".";
 					out << expr.first;
 				}
 				return out.str ();
@@ -508,7 +565,7 @@ namespace BOT_ORM
 			{ return And_Or (right, " or "); }
 
 		protected:
-			std::list<std::pair<std::string, const char*>> exprs;
+			std::list<std::pair<std::string, const std::string *>> exprs;
 
 			Expr And_Or (const Expr &right, std::string logOp) const
 			{
@@ -643,12 +700,12 @@ namespace BOT_ORM
 	public:
 		struct CompositeField
 		{
-			std::string fields;
-			const char *table;
+			std::string fieldName;
+			const std::string *tableName;
 
 			template <typename... Fields>
 			CompositeField (const Fields & ... args)
-				: table (nullptr)
+				: tableName (nullptr)
 			{
 				// Unpacking Tricks :-)
 				using expander = int[];
@@ -659,13 +716,13 @@ namespace BOT_ORM
 			template <typename T>
 			void Extract (const Expression::Field<T> &field)
 			{
-				if (table != nullptr && table != field.prefixStr)
+				if (tableName != nullptr && tableName != field.tableName)
 					throw std::runtime_error (NOT_SAME_TABLE);
-				table = field.prefixStr;
-				if (fields.empty ())
-					fields = field.fieldName;
+				tableName = field.tableName;
+				if (fieldName.empty ())
+					fieldName = field.fieldName;
 				else
-					fields = field.fieldName + "," + fields;
+					fieldName = field.fieldName + "," + fieldName;
 			}
 		};
 
@@ -675,7 +732,8 @@ namespace BOT_ORM
 			const T &value)
 		{
 			std::ostringstream os;
-			BOT_ORM_Impl::SerializeValue (os << " default ", value);
+			BOT_ORM_Impl::SerializationHelper::
+				Serialize (os << " default ", value);
 			return Constraint { os.str (), field.fieldName };
 		}
 
@@ -695,7 +753,7 @@ namespace BOT_ORM
 		static inline Constraint Unique (
 			const CompositeField &fields)
 		{
-			return Constraint { "unique (" + fields.fields + ")" };
+			return Constraint { "unique (" + fields.fieldName + ")" };
 		}
 
 		template <typename T>
@@ -705,7 +763,7 @@ namespace BOT_ORM
 		{
 			return Constraint {
 				std::string ("foreign key (") + field.fieldName +
-				") references " + refered.prefixStr +
+				") references " + *(refered.tableName) +
 				"(" + refered.fieldName + ")" };
 		}
 
@@ -714,9 +772,9 @@ namespace BOT_ORM
 			const CompositeField &refered)
 		{
 			return Constraint {
-				std::string ("foreign key (") + field.fields +
-				") references " + refered.table +
-				"(" + refered.fields + ")" };
+				std::string ("foreign key (") + field.fieldName +
+				") references " + *(refered.tableName) +
+				"(" + refered.fieldName + ")" };
 		}
 	};
 
@@ -783,21 +841,17 @@ namespace BOT_ORM_Impl
 		{
 			using type = Nullable<T>;
 		};
-		template <typename T>
-		using TypeToNullable_t = typename TypeToNullable <
-			std::remove_cv_t<std::remove_reference_t<T>> >::type;
 
-		// Tuple To Nullable
-		// Apply 'TypeToNullable' to each element of Tuple
+		// Fields To Nullable
+		// Apply 'TypeToNullable' to each element of Fields
 		template <typename... Args>
-		static inline auto TupleToNullable (
-			const std::tuple<Args...> &)
+		static inline auto FieldsToNullable (Args...)
 		{
 			// Unpacking Tricks :-)
 			// Expand each of 'Args'
 			// with 'TypeToNullable_t<...>' as a sequence
 			return std::tuple<
-				TypeToNullable_t<Args>...
+				typename TypeToNullable<Args>::type...
 			> {};
 		}
 
@@ -805,14 +859,18 @@ namespace BOT_ORM_Impl
 		template <typename C>
 		static inline auto QueryResultToTuple (const C &arg)
 		{
-			// Injected friend
-			return TupleToNullable (arg.__Tuple ());
+			return BOT_ORM_Impl::InjectionHelper::Visit (
+				arg, [] (auto ... args)
+			{
+				return FieldsToNullable (args...);
+			});
 		}
+
 		template <typename... Args>
 		static inline auto QueryResultToTuple (
 			const std::tuple<Args...>& t)
 		{
-			// TupleToNullable is not necessary: Nullable already
+			// FieldsToNullable is not necessary: Nullable already
 			return t;
 		}
 
@@ -852,7 +910,7 @@ namespace BOT_ORM_Impl
 		template <typename T>
 		static inline std::string FieldToSql (const Selectable<T> &op)
 		{
-			if (op.prefixStr) return op.prefixStr + ("." + op.fieldName);
+			if (op.tableName) return (*op.tableName) + "." + op.fieldName;
 			else return op.fieldName;
 		}
 		template <typename T, typename... Args>
@@ -871,6 +929,10 @@ namespace BOT_ORM
 	template <typename QueryResult>
 	class Queryable
 	{
+		template <typename C>
+		using HasInjected =
+			BOT_ORM_Impl::InjectionHelper::HasInjected<C>;
+
 	protected:
 		std::shared_ptr<BOT_ORM_Impl::SQLConnector> _connector;
 		QueryResult _queryHelper;
@@ -1007,13 +1069,35 @@ namespace BOT_ORM
 		// Join
 		template <typename C>
 		inline auto Join (const C &queryHelper2,
-						  const Expression::Expr &onExpr) const
+						  const Expression::Expr &onExpr,
+						  std::enable_if_t<
+						  !HasInjected<C>::value>
+						  * = nullptr) const
+		{}
+		template <typename C>
+		inline auto Join (const C &queryHelper2,
+						  const Expression::Expr &onExpr,
+						  std::enable_if_t<
+						  HasInjected<C>::value>
+						  * = nullptr) const
 		{
 			return _NewJoinQuery (queryHelper2, onExpr, " join ");
 		}
+
+		// Left Join
 		template <typename C>
 		inline auto LeftJoin (const C &queryHelper2,
-							  const Expression::Expr &onExpr) const
+							  const Expression::Expr &onExpr,
+							  std::enable_if_t<
+							  !HasInjected<C>::value>
+							  * = nullptr) const
+		{}
+		template <typename C>
+		inline auto LeftJoin (const C &queryHelper2,
+							  const Expression::Expr &onExpr,
+							  std::enable_if_t<
+							  HasInjected<C>::value>
+							  * = nullptr) const
 		{
 			return _NewJoinQuery (queryHelper2, onExpr, " left join ");
 		}
@@ -1033,11 +1117,12 @@ namespace BOT_ORM
 		Nullable<T> Select (const Expression::Aggregate<T> &agg) const
 		{
 			Nullable<T> ret;
-			_connector->Execute (_sqlSelect + agg.fieldName +
-								 _GetFromSql () + _GetLimit () + ";",
-								 [&] (int argc, char **argv, char **)
+			_connector->ExecuteCallback (_sqlSelect + agg.fieldName +
+										 _GetFromSql () + _GetLimit () + ";",
+										 [&] (char **argv)
 			{
-				BOT_ORM_Impl::DeserializeValue (ret, argv[0]);
+				BOT_ORM_Impl::DeserializationHelper::
+					Deserialize (ret, argv[0]);
 			});
 			return ret;
 		}
@@ -1082,24 +1167,12 @@ namespace BOT_ORM
 		template <typename C>
 		inline auto _NewJoinQuery (const C &queryHelper2,
 								   const Expression::Expr &onExpr,
-								   std::string joinStr,
-								   std::enable_if_t<
-								   !BOT_ORM_Impl::HasInjected<C>::value>
-								   * = nullptr) const
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
-		template <typename C>
-		inline auto _NewJoinQuery (const C &queryHelper2,
-								   const Expression::Expr &onExpr,
-								   std::string joinStr,
-								   std::enable_if_t<
-								   BOT_ORM_Impl::HasInjected<C>::value>
-								   * = nullptr) const
+								   std::string joinStr) const
 		{
 			return _NewQuery (
 				_sqlTarget,
-				_sqlFrom + std::move (joinStr) + C::__TableName +
+				_sqlFrom + std::move (joinStr) +
+				BOT_ORM_Impl::InjectionHelper::TableName (queryHelper2) +
 				" on " + onExpr.ToString (true),
 				BOT_ORM_Impl::QueryableHelper::JoinToTuple (
 					_queryHelper, queryHelper2));
@@ -1125,15 +1198,21 @@ namespace BOT_ORM
 		void _Select (const C &, Out &out) const
 		{
 			auto copy = _queryHelper;
-			_connector->Execute (_sqlSelect + _sqlTarget +
-								 _GetFromSql () + _GetLimit () + ";",
-								 [&] (int, char **argv, char **)
+			_connector->ExecuteCallback (_sqlSelect + _sqlTarget +
+										 _GetFromSql () + _GetLimit () + ";",
+										 [&] (char **argv)
 			{
-				size_t index = 1;
-				BOT_ORM_Impl::DeserializeValue (copy.__PrimaryKey (), argv[0]);
-				copy.__Accept ([&argv, &index] (auto &val)
+				BOT_ORM_Impl::InjectionHelper::Visit (
+					copy, [argv] (auto & ... args)
 				{
-					BOT_ORM_Impl::DeserializeValue (val, argv[index++]);
+					size_t index = 0;
+					// Unpacking Tricks :-)
+					using expander = int[];
+					(void) expander
+					{
+						0, (BOT_ORM_Impl::DeserializationHelper::
+							Deserialize (args, argv[index++]), 0)...
+					};
 				});
 				out.push_back (copy);
 			});
@@ -1144,15 +1223,16 @@ namespace BOT_ORM
 		void _Select (const std::tuple<Args...> &, Out &out) const
 		{
 			auto copy = _queryHelper;
-			_connector->Execute (_sqlSelect + _sqlTarget +
-								 _GetFromSql () + _GetLimit () + ";",
-								 [&] (int, char **argv, char **)
+			_connector->ExecuteCallback (_sqlSelect + _sqlTarget +
+										 _GetFromSql () + _GetLimit () + ";",
+										 [&] (char **argv)
 			{
 				size_t index = 0;
 				BOT_ORM_Impl::QueryableHelper::TupleVisit (
-					copy, [&argv, &index] (auto &val)
+					copy, [argv, &index] (auto &val)
 				{
-					BOT_ORM_Impl::DeserializeValue (val, argv[index++]);
+					BOT_ORM_Impl::DeserializationHelper::
+						Deserialize (val, argv[index++]);
 				});
 				out.push_back (copy);
 			});
@@ -1163,10 +1243,15 @@ namespace BOT_ORM
 
 	class ORMapper
 	{
+		template <typename C>
+		using HasInjected =
+			BOT_ORM_Impl::InjectionHelper::HasInjected<C>;
+
 	public:
 		ORMapper (const std::string &connectionString)
-			: _connector (std::make_shared<BOT_ORM_Impl::SQLConnector> (
-				connectionString))
+			: _connector (
+				std::make_shared<BOT_ORM_Impl::SQLConnector> (
+					connectionString))
 		{
 			_connector->Execute ("PRAGMA foreign_keys = ON;");
 		}
@@ -1188,64 +1273,76 @@ namespace BOT_ORM
 		}
 
 		template <typename C, typename... Args>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<!HasInjected<C>::value>
 			CreateTbl (const C &entity, const Args & ... args)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename C, typename... Args>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<HasInjected<C>::value>
 			CreateTbl (const C &entity, const Args & ... args)
 		{
-			const auto &fields = C::__FieldNames ();
+			const auto &fieldNames =
+				BOT_ORM_Impl::InjectionHelper::FieldNames (entity);
 			std::unordered_map<std::string, std::string> fieldFixes;
-			size_t index = 0;
 
-			fieldFixes.emplace (fields[index++],
-								_TypeString (entity.__PrimaryKey ()));
-			entity.__Accept ([&fields, &fieldFixes, &index] (auto &val)
+			auto addTypeStr = [&fieldNames, &fieldFixes] (
+				const auto &arg, size_t index)
 			{
-				fieldFixes.emplace (fields[index++], _TypeString (val));
+				// Why addTypeStr:
+				// Walkaround the 'undefined reference' in gcc/clang
+				constexpr const char *typeStr = BOT_ORM_Impl::TypeString<
+					std::remove_cv_t<std::remove_reference_t<decltype(arg)>>
+				>::typeStr;
+				fieldFixes.emplace (fieldNames[index], typeStr);
+			};
+
+			BOT_ORM_Impl::InjectionHelper::Visit (
+				entity, [&addTypeStr] (const auto & ... args)
+			{
+				size_t index = 0;
+				// Unpacking Tricks :-)
+				using expander = int[];
+				(void) expander
+				{
+					0, (addTypeStr (args, index++), 0)...
+				};
 			});
-			fieldFixes[fields[0]] += " primary key";
+			fieldFixes[fieldNames[0]] += " primary key";
 
 			std::string tableFixes;
 			_GetConstraints (tableFixes, fieldFixes, args...);
 
 			std::string strFmt;
-			for (const auto &field : fields)
+			for (const auto &field : fieldNames)
 				strFmt += field + fieldFixes[field] + ",";
 			strFmt += std::move (tableFixes);
 			strFmt.pop_back ();
 
-			_connector->Execute ("create table " +
-								 std::string (C::__TableName) +
-								 "(" + strFmt + ");");
+			_connector->Execute (
+				"create table " +
+				BOT_ORM_Impl::InjectionHelper::TableName (entity) +
+				"(" + strFmt + ");");
 		}
 
 		template <typename C>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
-			DropTbl (const C &)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		std::enable_if_t<!HasInjected<C>::value>
+			DropTbl (const C &entity)
+		{}
 		template <typename C>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
-			DropTbl (const C &)
+		std::enable_if_t<HasInjected<C>::value>
+			DropTbl (const C &entity)
 		{
-			_connector->Execute ("drop table " +
-								 std::string (C::__TableName) +
-								 ";");
+			_connector->Execute (
+				"drop table " +
+				BOT_ORM_Impl::InjectionHelper::TableName (entity) +
+				";");
 		}
 
 		template <typename C>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<!HasInjected<C>::value>
 			Insert (const C &entity, bool withId = true)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename C>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<HasInjected<C>::value>
 			Insert (const C &entity, bool withId = true)
 		{
 			std::ostringstream os;
@@ -1254,14 +1351,11 @@ namespace BOT_ORM
 		}
 
 		template <typename In, typename C = typename In::value_type>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<!HasInjected<C>::value>
 			InsertRange (const In &entities, bool withId = true)
-		{
-			static_assert (
-				BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename In, typename C = typename In::value_type>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<HasInjected<C>::value>
 			InsertRange (const In &entities, bool withId = true)
 		{
 			std::ostringstream os;
@@ -1276,13 +1370,11 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<!HasInjected<C>::value>
 			Update (const C &entity)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename C>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<HasInjected<C>::value>
 			Update (const C &entity)
 		{
 			std::ostringstream os;
@@ -1291,13 +1383,11 @@ namespace BOT_ORM
 		}
 
 		template <typename In, typename C = typename In::value_type>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<!HasInjected<C>::value>
 			UpdateRange (const In &entities)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename In, typename C = typename In::value_type>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<HasInjected<C>::value>
 			UpdateRange (const In &entities)
 		{
 			std::ostringstream os, osTmp;
@@ -1305,129 +1395,100 @@ namespace BOT_ORM
 				if (_GetUpdate (osTmp, entity))
 				{
 					os << osTmp.str ();
-					osTmp.str (std::string {});  // Flush the previous one
+					osTmp.str (std::string {});  // Flush the previous data
 				}
 			auto sql = os.str ();
 			if (!sql.empty ()) _connector->Execute (sql);
 		}
 
 		template <typename C>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
-			Update (const C &,
+		std::enable_if_t<!HasInjected<C>::value>
+			Update (const C &entity,
 					const Expression::SetExpr &setExpr,
 					const Expression::Expr &whereExpr)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename C>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
-			Update (const C &,
+		std::enable_if_t<HasInjected<C>::value>
+			Update (const C &entity,
 					const Expression::SetExpr &setExpr,
 					const Expression::Expr &whereExpr)
 		{
-			_connector->Execute ("update " +
-								 std::string (C::__TableName) +
-								 " set " + setExpr.ToString () +
-								 " where " +
-								 whereExpr.ToString (false) + ";");
+			_connector->Execute (
+				"update " +
+				BOT_ORM_Impl::InjectionHelper::TableName (entity) +
+				" set " + setExpr.ToString () +
+				" where " +
+				whereExpr.ToString (false) + ";");
 		}
 
 		template <typename C>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<!HasInjected<C>::value>
 			Delete (const C &entity)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename C>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<HasInjected<C>::value>
 			Delete (const C &entity)
 		{
+			const auto &fieldNames =
+				BOT_ORM_Impl::InjectionHelper::FieldNames (entity);
+
 			std::ostringstream os;
-			os << "delete from " << std::string (C::__TableName)
-				<< " where " << C::__FieldNames ()[0] << "=";
-			BOT_ORM_Impl::SerializeValue (os, entity.__PrimaryKey ());
+			os << "delete from "
+				<< BOT_ORM_Impl::InjectionHelper::TableName (entity)
+				<< " where " << fieldNames[0] << "=";
+
+			// Primary Key
+			BOT_ORM_Impl::InjectionHelper::Visit (
+				entity, [&os] (const auto &primaryKey,
+							   const auto & ... dummy)
+			{
+				// Why 'dummy'?
+				// It's an issue of gcc 5.4:
+				//   'template argument deduction/substitution failed'
+				//   if no 'dummy' literal (WTF) !!!
+				if (!BOT_ORM_Impl::SerializationHelper::
+					Serialize (os, primaryKey))
+					os << "null";
+			});
 			os << ";";
 
 			_connector->Execute (os.str ());
 		}
 
 		template <typename C>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
-			Delete (const C &,
+		std::enable_if_t<!HasInjected<C>::value>
+			Delete (const C &entity,
 					const Expression::Expr &whereExpr)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename C>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
-			Delete (const C &,
+		std::enable_if_t<HasInjected<C>::value>
+			Delete (const C &entity,
 					const Expression::Expr &whereExpr)
 		{
-			_connector->Execute ("delete from " +
-								 std::string (C::__TableName) +
-								 " where " +
-								 whereExpr.ToString (false) + ";");
+			_connector->Execute (
+				"delete from " +
+				BOT_ORM_Impl::InjectionHelper::TableName (entity) +
+				" where " +
+				whereExpr.ToString (false) + ";");
 		}
 
 		template <typename C>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value, Queryable<C>>
+		std::enable_if_t<!HasInjected<C>::value, Queryable<C>>
 			Query (C queryHelper)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		{}
 		template <typename C>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value, Queryable<C>>
+		std::enable_if_t<HasInjected<C>::value, Queryable<C>>
 			Query (C queryHelper)
 		{
-			return Queryable<C> (_connector,
-								 std::move (queryHelper),
-								 std::string (" from ") + C::__TableName);
+			return Queryable<C> (
+				_connector,
+				std::move (queryHelper),
+				std::string (" from ") +
+				BOT_ORM_Impl::InjectionHelper::TableName (queryHelper));
 		}
 
 	protected:
 		std::shared_ptr<BOT_ORM_Impl::SQLConnector> _connector;
-
-		template <typename T>
-		static inline const char *_TypeString (const T &)
-		{
-			constexpr static const char *typeStr =
-				(std::is_integral<T>::value &&
-				 !std::is_same<std::remove_cv_t<T>, char>::value &&
-				 !std::is_same<std::remove_cv_t<T>, wchar_t>::value &&
-				 !std::is_same<std::remove_cv_t<T>, char16_t>::value &&
-				 !std::is_same<std::remove_cv_t<T>, char32_t>::value &&
-				 !std::is_same<std::remove_cv_t<T>, unsigned char>::value)
-				? " integer not null"
-				: (std::is_floating_point<T>::value)
-				? " real not null"
-				: (std::is_same<std::remove_cv_t<T>, std::string>::value)
-				? " text not null"
-				: nullptr;
-
-			static_assert (typeStr != nullptr, BAD_TYPE);
-			return typeStr;
-		}
-
-		template <typename T>
-		static inline const char *_TypeString (const BOT_ORM::Nullable<T> &)
-		{
-			constexpr static const char *typeStr =
-				(std::is_integral<T>::value &&
-				 !std::is_same<std::remove_cv_t<T>, char>::value &&
-				 !std::is_same<std::remove_cv_t<T>, wchar_t>::value &&
-				 !std::is_same<std::remove_cv_t<T>, char16_t>::value &&
-				 !std::is_same<std::remove_cv_t<T>, char32_t>::value &&
-				 !std::is_same<std::remove_cv_t<T>, unsigned char>::value)
-				? " integer"
-				: (std::is_floating_point<T>::value)
-				? " real"
-				: (std::is_same<std::remove_cv_t<T>, std::string>::value)
-				? " text"
-				: nullptr;
-
-			static_assert (typeStr != nullptr, BAD_TYPE);
-			return typeStr;
-		}
 
 		static void _GetConstraints (
 			std::string &,
@@ -1449,85 +1510,122 @@ namespace BOT_ORM
 		}
 
 		template <typename C>
-		static void _GetInsert (std::ostream &os, const C &entity, bool withId)
+		static inline void _GetInsert (
+			std::ostream &os, const C &entity, bool withId)
 		{
-			const auto &fieldNames = C::__FieldNames ();
-			std::ostringstream osVal;
-			os << "insert into " << std::string (C::__TableName) << "(";
-
-			// Avoid Bad Eating of ,
-			bool anyField = false;
-
-			// Priamry Key
-			if (withId &&
-				BOT_ORM_Impl::SerializeValue (osVal, entity.__PrimaryKey ()))
+			BOT_ORM_Impl::InjectionHelper::Visit (
+				entity, [&os, &entity, withId] (
+					const auto &primaryKey, const auto & ... args)
 			{
-				os << fieldNames[0] << ",";
-				osVal << ",";
-				anyField = true;
-			}
+				const auto &fieldNames =
+					BOT_ORM_Impl::InjectionHelper::FieldNames (entity);
 
-			// The Rest
-			size_t index = 1;
-			entity.__Accept (
-				[&osVal, &os, &index, &anyField, &fieldNames] (auto &val)
-			{
-				if (BOT_ORM_Impl::SerializeValue (osVal, val))
+				os << "insert into "
+					<< BOT_ORM_Impl::InjectionHelper::TableName (entity)
+					<< "(";
+
+				std::ostringstream osVal;
+
+				// Avoid Bad Eating of ,
+				bool anyField = false;
+
+				auto serializeField =
+					[&fieldNames, &os, &osVal, &anyField] (
+						const auto &val, size_t index)
 				{
-					os << fieldNames[index] << ",";
+					if (BOT_ORM_Impl::SerializationHelper::
+						Serialize (osVal, val))
+					{
+						os << fieldNames[index] << ",";
+						osVal << ",";
+						anyField = true;
+					}
+				};
+
+				// Priamry Key
+				if (withId &&
+					BOT_ORM_Impl::SerializationHelper::
+					Serialize (osVal, primaryKey))
+				{
+					os << fieldNames[0] << ",";
 					osVal << ",";
 					anyField = true;
 				}
-				index++;
+
+				// The Rest
+				size_t index = 1;
+
+				// Unpacking Tricks :-)
+				using expander = int[];
+				(void) expander
+				{
+					0, (serializeField (args, index++), 0)...
+				};
+
+				if (anyField)
+				{
+					os.seekp (os.tellp () - std::streamoff (1));
+					osVal.seekp (osVal.tellp () - std::streamoff (1));
+				}
+				else  // Fix for No Field for Insert...
+				{
+					os << fieldNames[0];
+					osVal << "null";
+				}
+
+				osVal << ");";  // To Enable Seekp...
+				os << ") values (" << osVal.str ();
 			});
-
-			if (anyField)
-			{
-				os.seekp (os.tellp () - std::streamoff (1));
-				osVal.seekp (osVal.tellp () - std::streamoff (1));
-			}
-			else  // Fix for No Field for Insert...
-			{
-				os << fieldNames[0];
-				osVal << "null";
-			}
-
-			osVal << ");";  // Enable Seekp...
-			os << ") values (" << osVal.str ();
 		}
 
 		template <typename C>
-		static bool _GetUpdate (std::ostream &os, const C &entity)
+		static inline bool _GetUpdate (
+			std::ostream &os, const C &entity)
 		{
-			const auto &fieldNames = C::__FieldNames ();
-			os << "update " << C::__TableName << " set ";
-
-			// Avoid Bad Eating of ,
-			bool anyField = false;
-
-			// The Rest
-			size_t index = 1;
-			entity.__Accept (
-				[&os, &index, &anyField, &fieldNames] (auto &val)
+			return BOT_ORM_Impl::InjectionHelper::Visit (
+				entity, [&os, &entity] (
+					const auto &primaryKey, const auto & ... args)
 			{
-				os << fieldNames[index++] << "=";
-				if (!BOT_ORM_Impl::SerializeValue (os, val))
+				if (sizeof... (args) == 0)
+					return false;
+
+				const auto &fieldNames =
+					BOT_ORM_Impl::InjectionHelper::FieldNames (entity);
+				os << "update "
+					<< BOT_ORM_Impl::InjectionHelper::TableName (entity)
+					<< " set ";
+
+				auto serializeField = [&fieldNames, &os] (
+					const auto &val, size_t index)
+				{
+					os << fieldNames[index] << "=";
+					if (!BOT_ORM_Impl::SerializationHelper::
+						Serialize (os, val))
+						os << "null";
+					os << ",";
+				};
+
+				// The Rest
+				size_t index = 1;
+
+				// Unpacking Tricks :-)
+				using expander = int[];
+				(void) expander
+				{
+					0, (serializeField (args, index++), 0)...
+				};
+
+				os.seekp (os.tellp () - std::streamoff (1));
+
+				// Primary Key
+				os << " where " << fieldNames[0] << "=";
+				if (!BOT_ORM_Impl::SerializationHelper::
+					Serialize (os, primaryKey))
 					os << "null";
-				os << ",";
-				anyField = true;
+
+				os << ";";
+				return true;
 			});
-
-			if (!anyField)     // 'os' is ill-formed
-				return false;  // Only Primary Key in ORMAP
-
-			os.seekp (os.tellp () - std::streamoff (1));
-
-			// Primary Key
-			os << " where " << fieldNames[0] << "=";
-			if (!BOT_ORM_Impl::SerializeValue (os, entity.__PrimaryKey ()))
-				os << "null";
-			os << ";";
-			return true;
 		}
 	};
 
@@ -1535,34 +1633,41 @@ namespace BOT_ORM
 
 	class FieldExtractor
 	{
-		using pair_type = std::pair<const std::string &, const char *>;
+		using pair_type = std::pair<
+			const std::string &,
+			const std::string &>;
 
 		template <typename C>
-		std::enable_if_t<!BOT_ORM_Impl::HasInjected<C>::value>
-			Extract (const C &helper)
-		{
-			static_assert (BOT_ORM_Impl::HasInjected<C>::value, NO_ORMAP);
-		}
+		using HasInjected =
+			BOT_ORM_Impl::InjectionHelper::HasInjected<C>;
+
 		template <typename C>
-		std::enable_if_t<BOT_ORM_Impl::HasInjected<C>::value>
+		std::enable_if_t<!HasInjected<C>::value>
+			Extract (const C &helper)
+		{}
+		template <typename C>
+		std::enable_if_t<HasInjected<C>::value>
 			Extract (const C &helper)
 		{
-			// Why Place these local vars here:
-			// Walk around gcc/clang 'undefined reference' HELL
-			const auto &fieldNames = C::__FieldNames ();
-			constexpr auto tableName = C::__TableName;
-
-			// Primary Key
-			_map.emplace ((const void *) &(helper.__PrimaryKey ()),
-						  pair_type { fieldNames[0], tableName });
-
-			// The Rest
-			size_t index = 1;
-			helper.__Accept (
-				[this, &index, &fieldNames, &tableName] (auto &val)
+			BOT_ORM_Impl::InjectionHelper::Visit (
+				helper, [this, &helper] (
+					const auto & ... args)
 			{
-				_map.emplace ((const void *) &val, pair_type {
-					fieldNames[index++], tableName });
+				const auto &fieldNames =
+					BOT_ORM_Impl::InjectionHelper::FieldNames (helper);
+				const auto &tableName =
+					BOT_ORM_Impl::InjectionHelper::TableName (helper);
+
+				size_t index = 0;
+				// Unpacking Tricks :-)
+				using expander = int[];
+				(void) expander
+				{
+					0, (_map.emplace (
+						(const void *) &args,
+						pair_type { fieldNames[index++], tableName }
+					), 0)...
+				};
 			});
 		}
 
@@ -1581,7 +1686,7 @@ namespace BOT_ORM
 		{
 			const auto &result = Get (field);
 			return Expression::Field<T> {
-				std::move (result.first), result.second };
+				std::move (result.first), &result.second };
 		}
 
 		template <typename T>
@@ -1590,7 +1695,7 @@ namespace BOT_ORM
 		{
 			const auto &result = Get (field);
 			return Expression::NullableField<T> {
-				std::move (result.first), result.second };
+				std::move (result.first), &result.second };
 		}
 
 	private:
