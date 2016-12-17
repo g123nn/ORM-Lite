@@ -104,6 +104,7 @@ Note that:
   (otherwise SQLite 3 will Generate a Column for `ROWID` Implicitly)
 - Field Names MUST **NOT** be SQL Keywords (SQL Constraint);
 - `std::string` Value MUST **NOT** contain `\0` (SQL Constraint);
+- `std::string` Value can be **utf-8** to support **Locale**;
 - `ORMAP (...)` will **auto** Inject some **private members**;
   - `__Accept ()` to Implement **Visitor Pattern**;
   - `__Tuple ()` to **Flatten** data to tuple;
@@ -337,14 +338,14 @@ Remarks:
 ### Retrieve Results
 
 ``` cpp
-Nullable<T> Select (const Expression::Aggregate<T> &agg) const;
+Nullable<T> Aggregate (const Expression::Aggregate<T> &agg) const;
 std::vector<QueryResult> ToVector () const;
 std::list<QueryResult> ToList () const;
 ```
 
 Remarks:
 - `QueryResult` specifies the **Row Type** of Query Result;
-- `Select` will Get the one-or-zero-row Result for `agg` immediately;
+- `Aggregate` will Get the one-or-zero-row Result for `agg`;
 - `ToVector` / `ToList` returns the Collection of `QueryResult`;
 - The results are from the **Connection** of `Queryable`;
 - If the Result is `null` for `NOT Nullable` Field,
@@ -632,10 +633,13 @@ with the **Error Message** if Failed:
   > SQL error: Can't open database `<connectionString>`
 - Failed at Executing **Query** Script
   > SQL error: `<ErrorMessage>` at `<Generated SQL Script>`
-- Pass a **Non-Member** Var of Registered Object to Field **Extractor**
-  > No Such Field for current Extractor
+- Query Result's **Column Count** does **NOT Match** the Expected Count
+  (happening in **NOT** *Code First* Cases...)
+  > SQL error: Bad Column Count at `<Generated SQL Script>`
 - Get `NULL` from Query while the Expected **Field** is **NOT NULL**
   (happening in **NOT** *Code First* Cases...)
-  > Get Null Value for NOT Nullable Type
+  > SQL error: Get Null Value at `<Generated SQL Script>`
+- Pass a **Non-Member** Var of Registered Object to Field **Extractor**
+  > No Such Field for current Extractor
 - **Composite** Fields from **NOT** the Same Tables
   > Fields are NOT from the Same Table
